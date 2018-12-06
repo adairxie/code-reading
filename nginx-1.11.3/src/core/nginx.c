@@ -5,6 +5,7 @@
  */
 
 
+#define MY_DEBUG_MAIN 1
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <nginx.h>

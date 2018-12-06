@@ -1,6 +1,6 @@
 
 CC =	cc
-CFLAGS =  -pipe  -O -W -Wall -Wpointer-arith -Wno-unused-parameter -Werror -g 
+CFLAGS =  -pipe  -W -Wall -Wpointer-arith -Wno-unused-parameter -Werror -g -finstrument-functions
 CPP =	cc -E
 LINK =	$(CC)
 
@@ -15,6 +15,7 @@ ALL_INCS = -I src/core \
 
 
 CORE_DEPS = src/core/nginx.h \
+    src/core/my_debug.h \
 	src/core/ngx_config.h \
 	src/core/ngx_core.h \
 	src/core/ngx_log.h \
@@ -85,6 +86,7 @@ CORE_INCS = -I src/core \
 
 
 HTTP_DEPS = src/http/ngx_http.h \
+    src/core/my_debug.h \
 	src/http/ngx_http_request.h \
 	src/http/ngx_http_config.h \
 	src/http/ngx_http_core_module.h \
@@ -105,6 +107,7 @@ build:	binary modules manpage
 binary:	objs/nginx
 
 objs/nginx:	objs/src/core/nginx.o \
+    objs/src/core/my_debug.o \
 	objs/src/core/ngx_log.o \
 	objs/src/core/ngx_palloc.o \
 	objs/src/core/ngx_array.o \
@@ -221,6 +224,7 @@ objs/nginx:	objs/src/core/nginx.o \
 	objs/ngx_modules.o
 
 	$(LINK) -o objs/nginx \
+    objs/src/core/my_debug.o \
 	objs/src/core/nginx.o \
 	objs/src/core/ngx_log.o \
 	objs/src/core/ngx_palloc.o \
@@ -349,6 +353,12 @@ objs/ngx_modules.o:	$(CORE_DEPS) \
 		-o objs/ngx_modules.o \
 		objs/ngx_modules.c
 
+
+objs/src/core/my_debug.o:  $(CORE_DEPS) \
+    src/core/my_debug.c
+	$(CC) -c $(CFLAGS) $(CORE_INCS) \
+		-o objs/src/core/my_debug.o \
+        src/core/my_debug.c
 
 objs/src/core/nginx.o:	$(CORE_DEPS) \
 	src/core/nginx.c

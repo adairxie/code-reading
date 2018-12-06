@@ -2199,7 +2199,23 @@ ngx_http_file_cache_valid(ngx_array_t *cache_valid, ngx_uint_t status)
     return 0;
 }
 
-
+/*
+* proxy_cache_path: 缓存的存储路径和索引信息:
+* @ path, 缓存文件的根目录
+* @ level=N:N, 在目录的第几级缓存数据
+* @ keys_zone=name:size, 用于存放索引的共享内存区域名和大小
+* @ inactive=time, 强制更新缓存时间, 规定时间内没有访问则从内存中删除, 默认10m
+* @ max_size=size, 磁盘中缓存数据的上限, 缓存由cache manager管理, 超出则根据LRU策略删除
+* @ loader_sleep=time, 索引重建进程在两次遍历间的暂停时长，默认50ms
+* @ loader_files=number, 重建索引时，每次最多重建number个文件的索引, 默认100
+* @ loader_sleep, 和loader_files配合使用, 当已建立索引的文件个数大于loader_files, 就会休眠
+* @ loader_threshold, loader遍历至少每loader_threshold就要睡眠一次
+* 
+* proxy_cache_path, fastcgi_cacge_path 等需要缓存源服务器数据的配置走到这里
+* xxx_cahce缓存都是先写在临时目录xxx_temp_path，然后通过重命名再移到xxx_cache_path
+*
+* 源服务器响应数据在ngx_http_upstream_process_request->ngx_http_file_cache_update中进行缓存
+*/
 char *
 ngx_http_file_cache_set_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {

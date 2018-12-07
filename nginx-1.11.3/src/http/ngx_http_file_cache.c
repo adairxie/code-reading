@@ -2202,7 +2202,9 @@ ngx_http_file_cache_valid(ngx_array_t *cache_valid, ngx_uint_t status)
 /*
 * proxy_cache_path: 缓存的存储路径和索引信息:
 * @ path, 缓存文件的根目录
-* @ level=N:N, 在目录的第几级缓存数据
+* @ levels=N:N, 在目录的第几级缓存数据
+*   例如, levels=1:2, 意思是说使用两级目录, 第一级目录名是一个字符,
+*   第二级用两个字符, 但是nginx最大支持3级目录, 即levels=xxx:xxx:xxx
 * @ keys_zone=name:size, 用于存放索引的共享内存区域名和大小
 * @ inactive=time, 强制更新缓存时间, 规定时间内没有访问则从内存中删除, 默认10m
 * @ max_size=size, 磁盘中缓存数据的上限, 缓存由cache manager管理, 超出则根据LRU策略删除
@@ -2262,6 +2264,7 @@ ngx_http_file_cache_set_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         cache->path->name.len--;
     }
 
+    // 缓存路径如果是相对路径则根据prefix补全
     if (ngx_conf_full_name(cf->cycle, &cache->path->name, 0) != NGX_OK) {
         return NGX_CONF_ERROR;
     }
@@ -2442,10 +2445,12 @@ ngx_http_file_cache_set_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     cache->loader_sleep = loader_sleep;
     cache->loader_threshold = loader_threshold;
 
+    // 将缓存信息保存起来, 如果已存在则将cache->path替换为已有的缓存指针
     if (ngx_add_path(cf, &cache->path) != NGX_OK) {
         return NGX_CONF_ERROR;
     }
 
+    // 如果设置了use_temp_path=off, 则会在配置的path后面创建一层/temp目录
     if (!use_temp_path) {
         cache->temp_path = ngx_pcalloc(cf->pool, sizeof(ngx_path_t));
         if (cache->temp_path == NULL) {

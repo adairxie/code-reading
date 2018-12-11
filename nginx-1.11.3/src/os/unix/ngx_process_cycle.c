@@ -1150,13 +1150,13 @@ ngx_cache_manager_process_handler(ngx_event_t *ev)
     ngx_uint_t    i;
     ngx_path_t  **path;
 
-    next = 60 * 60;
+    next = 60 * 60; // 默认为1小时
 
     path = ngx_cycle->paths.elts;
     for (i = 0; i < ngx_cycle->paths.nelts; i++) {
 
         if (path[i]->manager) {
-            n = path[i]->manager(path[i]->data);
+            n = path[i]->manager(path[i]->data); // 执行回调(ngx_http_file_cache_manager) 返回n表示下一个过期检查时间点
 
             next = (n <= next) ? n : next;
 
@@ -1168,7 +1168,7 @@ ngx_cache_manager_process_handler(ngx_event_t *ev)
         next = 1;
     }
 
-    ngx_add_timer(ev, next * 1000);
+    ngx_add_timer(ev, next * 1000); // 再次将任务追加到定时器中
 }
 
 

@@ -980,10 +980,10 @@ ngx_http_file_cache_lookup(ngx_http_file_cache_t *cache, u_char *key)
     ngx_rbtree_node_t           *node, *sentinel;
     ngx_http_file_cache_node_t  *fcn;
 
-    ngx_memcpy((u_char *) &node_key, key, sizeof(ngx_rbtree_key_t));
+    ngx_memcpy((u_char *) &node_key, key, sizeof(ngx_rbtree_key_t)); //拷贝key的前面4个字符
 
-    node = cache->sh->rbtree.root;
-    sentinel = cache->sh->rbtree.sentinel;
+    node = cache->sh->rbtree.root; //红黑树根节点
+    sentinel = cache->sh->rbtree.sentinel; //红黑树哨兵节点
 
     while (node != sentinel) {
 
@@ -2064,7 +2064,7 @@ ngx_http_file_cache_noop(ngx_tree_ctx_t *ctx, ngx_str_t *path)
     return NGX_OK;
 }
 
-
+// 将缓存文件信息存入缓存中
 static ngx_int_t
 ngx_http_file_cache_manage_file(ngx_tree_ctx_t *ctx, ngx_str_t *path)
 {
@@ -2077,10 +2077,14 @@ ngx_http_file_cache_manage_file(ngx_tree_ctx_t *ctx, ngx_str_t *path)
         (void) ngx_http_file_cache_delete_file(ctx, path);
     }
 
-    if (++cache->files >= cache->loader_files) { //一次迭代加载的文件数最多为loader_filers
+    // 根据配置控制缓存文件的加载速度(loader_files, loader_threshold), 以便
+    // 在缓存文件很多的情况下降低启动时对系统资源的消耗
+    if (++cache->files >= cache->loader_files) {
+        //一次迭代加载的文件数最多为loader_files, 否则休眠并清理files计数
         ngx_http_file_cache_loader_sleep(cache);
 
     } else {
+        //否则看loader时间是不是过长, 如果过长则又进入睡眠
         ngx_time_update();
 
         elapsed = ngx_abs((ngx_msec_int_t) (ngx_current_msec - cache->last));
@@ -2121,7 +2125,10 @@ ngx_http_file_cache_loader_sleep(ngx_http_file_cache_t *cache)
     cache->files = 0;
 }
 
-
+/*
+* ngx_http_file_cache_add_file 主要是通过文件名计算hash, 然后调用ngx_http_file_cache_add
+* 将这个文件加入到cache管理中(也就是添加到红黑树以及队列)
+*/
 static ngx_int_t
 ngx_http_file_cache_add_file(ngx_tree_ctx_t *ctx, ngx_str_t *name)
 {
@@ -2165,6 +2172,9 @@ ngx_http_file_cache_add_file(ngx_tree_ctx_t *ctx, ngx_str_t *name)
 }
 
 
+// ngx_http_file_cache_add 函数将此缓存文件加入ngx_http_file_cache_sh_t类型的缓存管理机制中
+// 按照c->key在红黑树中查找, 没有就创建node节点, 然后把节点添加到红黑树cache->sh->rbtree和
+// cache->sh->queue队列头
 static ngx_int_t
 ngx_http_file_cache_add(ngx_http_file_cache_t *cache, ngx_http_cache_t *c)
 {
@@ -2172,10 +2182,10 @@ ngx_http_file_cache_add(ngx_http_file_cache_t *cache, ngx_http_cache_t *c)
 
     ngx_shmtx_lock(&cache->shpool->mutex);
 
-    fcn = ngx_http_file_cache_lookup(cache, c->key);
+    fcn = ngx_http_file_cache_lookup(cache, c->key); //首先查找
 
     if (fcn == NULL) {
-
+        // 如果不存在, 则新建结构
         fcn = ngx_slab_calloc_locked(cache->shpool,
                                      sizeof(ngx_http_file_cache_node_t));
         if (fcn == NULL) {
@@ -2207,12 +2217,13 @@ ngx_http_file_cache_add(ngx_http_file_cache_t *cache, ngx_http_cache_t *c)
         cache->sh->size += c->fs_size;
 
     } else {
+        //否则删除queue, 后续会重新插入
         ngx_queue_remove(&fcn->queue);
     }
 
     fcn->expire = ngx_time() + cache->inactive;
 
-    ngx_queue_insert_head(&cache->sh->queue, &fcn->queue);
+    ngx_queue_insert_head(&cache->sh->queue, &fcn->queue); //重新插入
 
     ngx_shmtx_unlock(&cache->shpool->mutex);
 

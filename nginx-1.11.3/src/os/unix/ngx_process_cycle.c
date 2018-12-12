@@ -1171,7 +1171,11 @@ ngx_cache_manager_process_handler(ngx_event_t *ev)
     ngx_add_timer(ev, next * 1000); // 再次将任务追加到定时器中
 }
 
-
+/*
+* nginx 进程启动时, 会试图从缓存对应的文件系统路径下的文件读取必要数据, 然后重建缓存
+* 的内存结构. 这个过程由cache loader进程完成.
+* 通过在ngx_cache_manager_process_cycle添加60秒定时器, 然后触发执行该函数
+*/
 static void
 ngx_cache_loader_process_handler(ngx_event_t *ev)
 {
@@ -1189,7 +1193,7 @@ ngx_cache_loader_process_handler(ngx_event_t *ev)
         }
 
         if (path[i]->loader) {
-            path[i]->loader(path[i]->data);
+            path[i]->loader(path[i]->data); // 实际执行函数为: ngx_http_file_cache_loader
             ngx_time_update();
         }
     }

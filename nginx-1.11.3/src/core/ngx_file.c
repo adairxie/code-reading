@@ -915,6 +915,16 @@ failed:
  * on fatal (memory) error handler must return NGX_ABORT to stop walking tree
  */
 
+/*
+* ngx_walk_tree是递归函数, 打开每层路径(dir)知道每个文件(file), 根据其路径和文件名
+* 得到key, 在缓存的rbtree(红黑树)里面找这个key(部分), 如果没有找到的话, 就在内存中分
+* 配一个映射这个文件的node(但是不会把文件的内容进行缓存), 然后插入到红黑树中和加入队列.
+*
+* ngx_walk_tree这个函数主要是遍历所有的cache目录, 然后对于
+* 每一个cache文件调用file_handler回调.
+* ctx->file_handler => ngx_http_file_cache_manager_file, 文件加载函数
+* ctx->pre_tree_handler => ngx_http_file_cache_noop
+*/
 ngx_int_t
 ngx_walk_tree(ngx_tree_ctx_t *ctx, ngx_str_t *tree)
 {
@@ -931,7 +941,7 @@ ngx_walk_tree(ngx_tree_ctx_t *ctx, ngx_str_t *tree)
     ngx_log_debug1(NGX_LOG_DEBUG_CORE, ctx->log, 0,
                    "walk tree \"%V\"", tree);
 
-    if (ngx_open_dir(tree, &dir) == NGX_ERROR) {
+    if (ngx_open_dir(tree, &dir) == NGX_ERROR) { //打开缓存文件目录
         ngx_log_error(NGX_LOG_CRIT, ctx->log, ngx_errno,
                       ngx_open_dir_n " \"%s\" failed", tree->data);
         return NGX_ERROR;
@@ -959,7 +969,7 @@ ngx_walk_tree(ngx_tree_ctx_t *ctx, ngx_str_t *tree)
 
         ngx_set_errno(0);
 
-        if (ngx_read_dir(&dir) == NGX_ERROR) {
+        if (ngx_read_dir(&dir) == NGX_ERROR) { //读取子目录信息
             err = ngx_errno;
 
             if (err == NGX_ENOMOREFILES) {
@@ -1021,7 +1031,7 @@ ngx_walk_tree(ngx_tree_ctx_t *ctx, ngx_str_t *tree)
             }
         }
 
-        if (ngx_de_is_file(&dir)) {
+        if (ngx_de_is_file(&dir)) { // 文件
 
             ngx_log_debug1(NGX_LOG_DEBUG_CORE, ctx->log, 0,
                            "tree file \"%s\"", file.data);
@@ -1031,11 +1041,12 @@ ngx_walk_tree(ngx_tree_ctx_t *ctx, ngx_str_t *tree)
             ctx->access = ngx_de_access(&dir);
             ctx->mtime = ngx_de_mtime(&dir);
 
+            // 处理文件的操作. 实际执行函数为ngx_http_file_cache_manage_file
             if (ctx->file_handler(ctx, &file) == NGX_ABORT) {
                 goto failed;
             }
 
-        } else if (ngx_de_is_dir(&dir)) {
+        } else if (ngx_de_is_dir(&dir)) { // 目录
 
             ngx_log_debug1(NGX_LOG_DEBUG_CORE, ctx->log, 0,
                            "tree enter dir \"%s\"", file.data);

@@ -1883,6 +1883,12 @@ ngx_http_file_cache_expire(ngx_http_file_cache_t *cache)
 }
 
 
+/*
+* 缓存文件清理过程均调用了ngx_http_file_cache_delete函数, 并且调用它的前提条件
+* 是当前函数已经获得了cache->shpool->mutex锁, 同时, 当前缓存节点的引用计数为0.
+*
+* 它主要有2个功能, 一个是删除cache文件, 一个是删除cache管理节点
+*/
 static void
 ngx_http_file_cache_delete(ngx_http_file_cache_t *cache, ngx_queue_t *q,
     u_char *name)
@@ -1892,10 +1898,11 @@ ngx_http_file_cache_delete(ngx_http_file_cache_t *cache, ngx_queue_t *q,
     ngx_path_t                  *path;
     ngx_http_file_cache_node_t  *fcn;
 
+    // 取ngx_http_file_cache_node_t数据
     fcn = ngx_queue_data(q, ngx_http_file_cache_node_t, queue);
 
-    if (fcn->exists) {
-        cache->sh->size -= fcn->fs_size;
+    if (fcn->exists) { // 如果缓存文件存在
+        cache->sh->size -= fcn->fs_size; // 这块共享内存释放了, 总共占用的共享内存也就少了这么多
 
         path = cache->path;
         p = name + path->name.len + 1 + path->len;
@@ -1905,8 +1912,12 @@ ngx_http_file_cache_delete(ngx_http_file_cache_t *cache, ngx_queue_t *q,
         p = ngx_hex_dump(p, fcn->key, len);
         *p = '\0';
 
+        // count加1, 以避免其他进程再次尝试清理此节点(当前代码中还不会有这种情况发生)
         fcn->count++;
+        // deleting标识此缓存节点正在被删除, 其他函数或进程因此视其为无效节点.
         fcn->deleting = 1;
+        // 由于文件删除操作(ngx_delete_file)可能发生阻塞, 所以进行这个操作期间, 函数
+        // 将缓存锁先释放掉, 以免其它进程因为等待这个锁而阻塞.
         ngx_shmtx_unlock(&cache->shpool->mutex);
 
         len = path->name.len + 1 + path->len + 2 * NGX_HTTP_CACHE_KEY_LEN;
@@ -1987,6 +1998,17 @@ ngx_http_file_cache_manager(void *data)
 }
 
 
+/*
+* 在nginx启动1分钟之后, 会启动一个名为cache loader的进程,
+* 该进程运行了一段时间之后, 该进程就会结束消失.
+*
+* 在该进程运行期间主要做了以下事情: 遍历配置文件中proxy_cache_path命令指定的路径中的
+* 所有的缓存文件, 并且针对遍历到的各个缓存文件的MD5编码先遍历红黑树和相应的
+* ngx_http_file_cache_node_t节点, 如果不存在就创建新的ngx_http_file_cache_node_t, 并将
+* 该对象中的rbnode和queue分别插入到红黑树和过期队列: 如果存在, 则更新相应的属性.
+*
+* ngx_cache_loader_process_handler->ngx_http_file_cache_loader
+*/
 static void
 ngx_http_file_cache_loader(void *data)
 {
@@ -1994,7 +2016,8 @@ ngx_http_file_cache_loader(void *data)
 
     ngx_tree_ctx_t  tree;
 
-    if (!cache->sh->cold || cache->sh->loading) {
+    // nginx启动后cold=1, loading = 0 (loading=1)
+    if (!cache->sh->cold || cache->sh->loading) { // 表示已经加载完毕
         return;
     }
 
@@ -2010,14 +2033,16 @@ ngx_http_file_cache_loader(void *data)
     tree.pre_tree_handler = ngx_http_file_cache_manage_directory;
     tree.post_tree_handler = ngx_http_file_cache_noop;
     tree.spec_handler = ngx_http_file_cache_delete_file;
-    tree.data = cache;
+    //上述的注册方法都会在ngx_walk_tree方法中进行调用
+
+    tree.data = cache; //回调数据就是cache
     tree.alloc = 0;
     tree.log = ngx_cycle->log;
 
-    cache->last = ngx_current_msec;
+    cache->last = ngx_current_msec; //last为最好load时间
     cache->files = 0;
 
-    if (ngx_walk_tree(&tree, &cache->path->name) == NGX_ABORT) {
+    if (ngx_walk_tree(&tree, &cache->path->name) == NGX_ABORT) { //开始遍历
         cache->sh->loading = 0;
         return;
     }
@@ -2048,11 +2073,11 @@ ngx_http_file_cache_manage_file(ngx_tree_ctx_t *ctx, ngx_str_t *path)
 
     cache = ctx->data;
 
-    if (ngx_http_file_cache_add_file(ctx, path) != NGX_OK) {
+    if (ngx_http_file_cache_add_file(ctx, path) != NGX_OK) { // 将文件添加到cache
         (void) ngx_http_file_cache_delete_file(ctx, path);
     }
 
-    if (++cache->files >= cache->loader_files) {
+    if (++cache->files >= cache->loader_files) { //一次迭代加载的文件数最多为loader_filers
         ngx_http_file_cache_loader_sleep(cache);
 
     } else {
@@ -2063,7 +2088,7 @@ ngx_http_file_cache_manage_file(ngx_tree_ctx_t *ctx, ngx_str_t *path)
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
                        "http file cache loader time elapsed: %M", elapsed);
 
-        if (elapsed >= cache->loader_threshold) {
+        if (elapsed >= cache->loader_threshold) { // loader时间过长, 则睡眠
             ngx_http_file_cache_loader_sleep(cache);
         }
     }

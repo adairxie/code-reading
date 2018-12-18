@@ -261,10 +261,20 @@ ngx_http_file_cache_create_key(ngx_http_request_t *r)
     ngx_memcpy(c->main, c->key, NGX_HTTP_CACHE_KEY_LEN);
 }
 
-
+/*
+* ngx_http_file_cache_open->ngx_http_file_cache_read->ngx_http_file_cache_aio_read
+* 这个流程获取文件中前面的头部信息相关内容, 并获取整个文件stat信息, 例如文件大小等.
+* 头部部分在ngx_http_cache_send->ngx_http_send_header发送,
+* 缓存文件后面的包体部分在ngx_http_cache_send后半部代码中出发, 在filter模块中发送.
+*
+* ngx_http_file_cache_open 函数查找是否有对应的有效缓存数据, 负责缓存文件定位、
+* 缓存文件打开和校验等操作
+*/
 ngx_int_t
 ngx_http_file_cache_open(ngx_http_request_t *r)
 {
+    // 读取缓存文件前面的头部信息数据到r->cache->buf
+    // 同时获取文件的相关属性到r->cache的相关字段
     ngx_int_t                  rc, rv;
     ngx_uint_t                 test;
     ngx_http_cache_t          *c;
@@ -276,6 +286,7 @@ ngx_http_file_cache_open(ngx_http_request_t *r)
     c = r->cache;
 
     if (c->waiting) {
+        // 缓存内容已过期，当前请求正等待其他请求更新此缓存节点.
         return NGX_AGAIN;
     }
 
@@ -283,8 +294,10 @@ ngx_http_file_cache_open(ngx_http_request_t *r)
         return ngx_http_file_cache_read(r, c);
     }
 
+    // 通过proxy_cache xxx或者fastcgi_cache xxx来设置的共享内存等信息
     cache = c->file_cache;
 
+    // 第一次根据请求信息生成的key查找对应缓存节点时, 先注册一下请求内存池级别的清理函数
     if (c->node == NULL) {
         cln = ngx_pool_cleanup_add(r->pool, 0);
         if (cln == NULL) {
@@ -315,12 +328,16 @@ ngx_http_file_cache_open(ngx_http_request_t *r)
         }
 
         c->temp_file = 1;
+        // 是否有达到proxy_cache_min_uses 5配置的开始缓存文件的请求次数, 达到为1，没达到为0
         test = c->exists ? 1 : 0;
-        rv = NGX_DECLINED;
+        rv = NGX_DECLINED; //如果返回这个, 会把cached置0, 返回出去后只有从后端重新获取数据
 
     } else { /* rc == NGX_DECLINED */
+        // 表示在ngx_http_file_cache_exists中没找到该key对应的node节点, 或者改节点对应缓存
+        // 过期, 返回NGX_DECLINED(第一次请求该URL)
 
-        test = cache->sh->cold ? 1 : 0;
+        test = cache->sh->cold ? 1 : 0; // test=0, 表示进程起来后缓存文件已经加载完毕，为1
+        // 进程刚起来还没有加载缓存文件, 默认为1
 
         if (c->min_uses > 1) {
 
@@ -341,6 +358,9 @@ ngx_http_file_cache_open(ngx_http_request_t *r)
     }
 
     if (!test) {
+        // 还没达到proxy_cache_min_uses 5 配置的开始缓存文件的请求次数
+        // nginx进程起来后, loader进程已经把缓存文件加载完毕, 但是在红黑树中没有找到
+        // 对应的文件node节点(第一次请求该URI)
         goto done;
     }
 
@@ -357,7 +377,7 @@ ngx_http_file_cache_open(ngx_http_request_t *r)
 
     if (ngx_open_cached_file(clcf->open_file_cache, &c->file.name, &of, r->pool)
         != NGX_OK)
-    {
+    { // 一般没有该文件的时候会走到这里面
         switch (of.err) {
 
         case 0:
@@ -381,7 +401,7 @@ ngx_http_file_cache_open(ngx_http_request_t *r)
     c->file.log = r->connection->log;
     c->uniq = of.uniq;
     c->length = of.size;
-    c->fs_size = (of.fs_size + cache->bsize - 1) / cache->bsize;
+    c->fs_size = (of.fs_size + cache->bsize - 1) / cache->bsize; // bsize对齐
 
     c->buf = ngx_create_temp_buf(r->pool, c->body_start);
     if (c->buf == NULL) {

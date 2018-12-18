@@ -821,7 +821,12 @@ static ngx_path_init_t  ngx_http_proxy_temp_path = {
     ngx_string(NGX_HTTP_PROXY_TEMP_PATH), { 1, 2, 0 }
 };
 
-
+/*
+* 配置proxy_pass后, 在ngx_http_core_content_phase里面指向该函数
+* 那么, 当有请求访问到特定的location的时候(假设这个location配置了proxy_pass指令),
+* 跟其他请求一样，会调用各个phase的checker和handler，到了NGX_HTTP_CONTENT_PHASE的checker,
+* 即ngx_http_core_content_phase()的时候, 会调用r->content_handler(r), 即ngx_http_proxy_handler
+*/
 static ngx_int_t
 ngx_http_proxy_handler(ngx_http_request_t *r)
 {
@@ -833,6 +838,7 @@ ngx_http_proxy_handler(ngx_http_request_t *r)
     ngx_http_proxy_main_conf_t  *pmcf;
 #endif
 
+    // 生成一个ngx_http_upstream_t结构, 赋值到r->upstream
     if (ngx_http_upstream_create(r) != NGX_OK) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
@@ -842,6 +848,8 @@ ngx_http_proxy_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
+    // 将这个上下文放到请求的ctx数组的ngx_http_proxy_module模块中, r->ctx[module.ctx_index]
+    // = c;
     ngx_http_set_ctx(r, ctx, ngx_http_proxy_module);
 
     plcf = ngx_http_get_module_loc_conf(r, ngx_http_proxy_module);
@@ -857,6 +865,7 @@ ngx_http_proxy_handler(ngx_http_request_t *r)
 
     } else {
         if (ngx_http_proxy_eval(r, ctx, plcf) != NGX_OK) {
+            // 获取uri中变量的值, 从而可以得到完整的uri, 和ngx_http_proxy_pass配合阅读
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
     }
@@ -872,6 +881,7 @@ ngx_http_proxy_handler(ngx_http_request_t *r)
     u->create_key = ngx_http_proxy_create_key;
 #endif
 
+    // 生成发送到上游服务器的请求缓冲(或者一条缓冲链), 也就是要发给上游的数据
     u->create_request = ngx_http_proxy_create_request;
     u->reinit_request = ngx_http_proxy_reinit_request;
     u->process_header = ngx_http_proxy_process_status_line;

@@ -2692,6 +2692,11 @@ ngx_http_request_finalizer(ngx_http_request_t *r)
 }
 
 
+/*
+* 把读事件从epoll中移除。只对epoll lt模式起作用. 它的意义在于, 目前已经开始处理HTTP请求,
+* 除非某个HTTP模块重新设置了read_event_handler方法, 否则任何读事件都讲得不到处理, 也可以
+* 认为读事件被阻塞了.
+*/
 void
 ngx_http_block_reading(ngx_http_request_t *r)
 {

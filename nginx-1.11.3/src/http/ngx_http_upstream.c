@@ -812,7 +812,7 @@ found:
         u->peer.tries = u->conf->next_upstream_tries;
     }
 
-    ngx_http_upstream_connect(r, u);
+    ngx_http_upstream_connect(r, u); //向上游服务器发起连接
 }
 
 
@@ -1381,7 +1381,15 @@ ngx_http_upstream_check_broken_connection(ngx_http_request_t *r,
     }
 }
 
-
+/*
+* upstream机制与上游服务器是通过TCP建立连接的, 众所周知, 建立TCP连接需要三次握手, 而三次握手
+* 消耗的时间是不可控的. 为了保证建立TCP连接这个操作不会阻塞进程, nginx使用非阻塞的套接
+* 字来连接上游服务器. 调用的ngx_http_upsteam_connect方法就是用来连接上游服务器的.
+* 由于使用了非阻塞的套接字, 当方法返回时与上游之间的TCP连接未必会成功建立, 可能还需要等
+* 待上游服务器返回的TCP的SYN/ACK包. 因此, ngx_http_upstream_connect方法主要负责发起建立
+* 连接这个动作, 如果这个方法没有立刻返回成功, 那么需要在epoll中监控这个套接字, 当它出现
+* 可写事件时, 就说明连接已经建立成功了.
+*/
 static void
 ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
 {
@@ -1407,12 +1415,12 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
     u->state->connect_time = (ngx_msec_t) -1;
     u->state->header_time = (ngx_msec_t) -1;
 
-    rc = ngx_event_connect_peer(&u->peer);
+    rc = ngx_event_connect_peer(&u->peer); // 建立一个TCP套接字, 同时, 这个套接字需要设置为非阻塞模式
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http upstream connect: %i", rc);
 
-    if (rc == NGX_ERROR) {
+    if (rc == NGX_ERROR) { // 表示发起连接失败
         ngx_http_upstream_finalize_request(r, u,
                                            NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
@@ -1421,12 +1429,14 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
     u->state->peer = u->peer.name;
 
     if (rc == NGX_BUSY) {
+        // 表示当前上游服务器处于不活跃状态, 则尝试与其他上游服务器建立连接
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "no live upstreams");
         ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_NOLIVE);
         return;
     }
 
     if (rc == NGX_DECLINED) {
+        // 表示当前上游服务器负载过重, 则尝试与其他上游服务器建立连接
         ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
         return;
     }
@@ -1437,6 +1447,11 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
 
     c->data = r;
 
+    /*
+    * 设置上游连接ngx_connection_t结构体的读事件、写事件的回调方法handler都为ngx_http_upstream_handler
+    * 设置ngx_http_upstream_t结构体的写事件write_event_handler的回调为ngx_http_upstream_send_request_handler
+    * 设置读事件回调为read_event_handler的回调方法为ngx_http_upstream_process_header
+    */
     c->write->handler = ngx_http_upstream_handler;
     c->read->handler = ngx_http_upstream_handler;
 
@@ -1507,11 +1522,20 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
     u->request_sent = 0;
     u->request_body_sent = 0;
 
-    if (rc == NGX_AGAIN) {
+    if (rc == NGX_AGAIN) { // 这里的定时器在ngx_http_upstream_send_request会删除
+        /*
+        * 若rc = NGX_AGAIN，表示当前已经发起连接，但是没有收到上游服务器的SYN/ACK报文，即
+        * 上游连接还没有建立起来。
+        * 调用ngx_add_timer方法将上游连接的可写事件添加到定时器中，管理连接超时，超时事件为
+        * ngx_http_upsteam_conf_t结构体中的connect_timeout成员。
+        */
         ngx_add_timer(c->write, u->conf->connect_timeout);
-        return;
+        return; // 大部分情况在这里返回，然后通过ngx_http_upstream_send_request_handler来执行
+        // epoll write事件
     }
 
+    // 如 rc = NGX_OK，表示成功建立连接，则调用ngx_http_upstream_send_request方法向上游服务器
+    // 发送请求。
 #if (NGX_HTTP_SSL)
 
     if (u->ssl && c->ssl == NULL) {
@@ -1836,6 +1860,9 @@ ngx_http_upstream_reinit(ngx_http_request_t *r, ngx_http_upstream_t *u)
 }
 
 
+/*向上游服务器发送请求 当一次发送不完，就向epoll添加可写事件并设置回调函数
+* 为ngx_http_upstream_send_request_handler, 等待连接再次可写时触发发送数据
+*/
 static void
 ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
     ngx_uint_t do_write)
@@ -1843,7 +1870,7 @@ ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
     ngx_int_t          rc;
     ngx_connection_t  *c;
 
-    c = u->peer.connection;
+    c = u->peer.connection; // nginx与上游服务器的连接信息
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
                    "http upstream send request");
@@ -1852,6 +1879,7 @@ ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
         u->state->connect_time = ngx_current_msec - u->state->response_time;
     }
 
+    // 通过getsocketopt测试与上游服务器的tcp连接是否异常
     if (!u->request_sent && ngx_http_upstream_test_connect(c) != NGX_OK) {
         ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
         return;
@@ -1862,6 +1890,8 @@ ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
     rc = ngx_http_upstream_send_request_body(r, u, do_write);
 
     if (rc == NGX_ERROR) {
+        // 表示当前连接上出错，将错误信息传递给ngx_http_upstream_next方法，该方法根据错误信息
+        // 决定是否重新向上游其他服务器发起连接;
         ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
         return;
     }
@@ -1871,9 +1901,16 @@ ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
         return;
     }
 
-    if (rc == NGX_AGAIN) {
+    /*
+    * 若 rc == NGX_AGAIN，表示请求数据并未发送完，即有剩余的请求数据保存在output中，但此时
+    * 连接已不可写，则调用ngx_add_timer方法把当前连接上的写事件添加到定时器机制中，并调用
+    * ngx_handle_write_event方法将写事件注册到epoll事件机制中;
+    * 可写的回调函数为ngx_http_upstream_read_request_handler
+    */
+    if (rc == NGX_AGAIN) { //栈缓冲区已满，需要等待数据发出去后再次出发epoll可写事件，从而继续写
         if (!c->write->ready) {
             ngx_add_timer(c->write, u->conf->send_timeout);
+            // 如果超时会执行ngx_http_upstream_send_request_handler, 这里面对写超时进行处理
 
         } else if (c->write->timer_set) {
             ngx_del_timer(c->write);
@@ -1916,6 +1953,13 @@ ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
         return;
     }
 
+    // 设置接收后端应答的超时定时器。
+    /*
+        该定时器在收到后端应答数据后删除, 见ngx_event_pipe
+        if (rev->timer_set) {
+            ngx_del_timer(rev, NGX_FUNC_LINE);
+        }
+    */
     ngx_add_timer(c->read, u->conf->read_timeout);
 
     if (c->read->ready) {

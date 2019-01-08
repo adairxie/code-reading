@@ -2276,6 +2276,7 @@ ngx_http_file_cache_set_watermark(ngx_http_file_cache_t *cache)
 }
 
 
+// 获取 proxy_cache_valid xxx 4m;中的4m, 根据status查找对应的时间
 time_t
 ngx_http_file_cache_valid(ngx_array_t *cache_valid, ngx_uint_t status)
 {

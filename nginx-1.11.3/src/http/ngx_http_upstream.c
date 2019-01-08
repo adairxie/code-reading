@@ -818,6 +818,13 @@ found:
 
 #if (NGX_HTTP_CACHE)
 
+/*
+* ngx_http_upsteam_init_request->ngx_http_upstream_cache 客户端获取缓存 后端应答回来数据后
+* 在ngx_http_upstream_send_response->ngx_http_file_cache_create 中创建临时文件，然后在
+* ngx_event_pipe_write_chain_to_temp_file把读取的后端数据写入临时文件，最后在
+* ngx_http_upstream_send_response->ngx_http_upstream_process_request->ngx_http_file_cache_update
+* 中把临时文件rename到proxy_cache_path指定的cache目录下面
+*/
 static ngx_int_t
 ngx_http_upstream_cache(ngx_http_request_t *r, ngx_http_upstream_t *u)
 {
@@ -2766,7 +2773,7 @@ ngx_http_upstream_process_body_in_memory(ngx_http_request_t *r,
     }
 }
 
-
+// 发送上游服务器返回回来的数据给客户端。里面会处理header，body分开发送的情况的
 static void
 ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
 {
@@ -2777,58 +2784,78 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
     ngx_connection_t          *c;
     ngx_http_core_loc_conf_t  *clcf;
 
-    rc = ngx_http_send_header(r);
+    rc = ngx_http_send_header(r); // 先发header，再发body，调用每一个filter过滤处理头部数据。
 
     if (rc == NGX_ERROR || rc > NGX_OK || r->post_action) {
         ngx_http_upstream_finalize_request(r, u, rc);
         return;
     }
 
-    u->header_sent = 1;
+    u->header_sent = 1; // 标记已经发送了头部字段，至少是已经挂在出去，经过了filter了。
 
     if (u->upgrade) {
         ngx_http_upstream_upgrade(r, u);
         return;
     }
 
+    // c 是nginx与下游客户端之间的连接
     c = r->connection;
 
-    if (r->header_only) {
+    if (r->header_only) { // 如果只需要发送头部数据，比如客户端用curl -I访问的。
 
-        if (!u->buffering) {
+        if (!u->buffering) { // 如果配置了不需要缓存上游服务器的响应包体，在直接结束
             ngx_http_upstream_finalize_request(r, u, rc);
             return;
         }
 
-        if (!u->cacheable && !u->store) {
+        if (!u->cacheable && !u->store) { // 如果没有开启文件缓存
             ngx_http_upstream_finalize_request(r, u, rc);
             return;
         }
 
-        u->pipe->downstream_error = 1;
+        u->pipe->downstream_error = 1; // 明明客户端只请求头部，但是上游却配置或者要求缓存或者存储包体
     }
 
     if (r->request_body && r->request_body->temp_file) {
+        // 客户端发送过来的包体存储在临时文件中，则需要先删除临时文件
         ngx_pool_run_cleanup_file(r->pool, r->request_body->temp_file->file.fd);
+        // 临时文件内容已经不需要了，因为在create_request中已经把临时文件内容赋值给u->request_bufs
+        // 并发送到了后端服务器。
         r->request_body->temp_file->file.fd = NGX_INVALID_FILE;
     }
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
+    /*
+    * 如果开启缓冲(以上游服务器网速优先)，那么nginx将尽可能多地读取上游服务器的响应数据，
+    * 到达到一定量(比如buffer满)在传送给下游客户。
+    * 如果关闭缓冲(以下游客户端网速优先)，那么nginx对数据的中转就是一个同步的过程，即从
+    * 上游服务器接收到响应数据后就立即将其发送给客户端。
+    */
     if (!u->buffering) {
+        // buffering为1，表示先缓存上游服务器响应的包体，然后在发送到下游，如果该值为0，
+        // 则接收多少上游包体就向下游转发多少。
 
         if (u->input_filter == NULL) {
             u->input_filter_init = ngx_http_upstream_non_buffered_filter_init;
+            // ngx_http_upsteam_non_buffered_filter将u->buffer.last - u->buffer.pos之间的
+            // 数据放到u->out_bufs发送缓冲区链表里面。
             u->input_filter = ngx_http_upstream_non_buffered_filter;
             u->input_filter_ctx = r;
         }
 
+        // 设置upsteam的读事件回调，用来读取上游响应包体
         u->read_event_handler = ngx_http_upstream_process_non_buffered_upstream;
+        // 设置下游连接的写事件，用来发送上游服务器群响应数据，并调用过滤模块，一个一个
+        // 过滤body，最终发送出去。
         r->write_event_handler =
                              ngx_http_upstream_process_non_buffered_downstream;
 
         r->limit_rate = 0;
-
+        
+        // ngx_http_XXX_input_filter_init(如ngx_http_fastcgi_input_filter_init
+        // ngx_http_proxy_input_filter_init, ngx_http_proxy_input_filter_init等)
+        // 只有memcached会执行ngx_http_memcached_filter_init，其他方式什么也没做
         if (u->input_filter_init(u->input_filter_ctx) == NGX_ERROR) {
             ngx_http_upstream_finalize_request(r, u, NGX_ERROR);
             return;
@@ -2852,12 +2879,18 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
         }
 
         n = u->buffer.last - u->buffer.pos;
+        
+        /*
+        * 不是还没接收到包体吗，为什么就开始发送了呢?
+        *   这是因为在前面的ngx_http_upstream_process_header处理包头的时候也标识出了接收到的包体
+        */
 
-        if (n) {
+        if (n) { //得到将要发送的数据的大小，每次有多少就发送多少。
             u->buffer.last = u->buffer.pos;
 
             u->state->response_length += n;
 
+            // 下面的input_filter只是将buffer上面的将要发送数据的指针赋值给u->out_bufs
             if (u->input_filter(u->input_filter_ctx, n) == NGX_ERROR) {
                 ngx_http_upstream_finalize_request(r, u, NGX_ERROR);
                 return;
@@ -2866,6 +2899,7 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
             ngx_http_upstream_process_non_buffered_downstream(r);
 
         } else {
+            // 清空缓存区
             u->buffer.pos = u->buffer.start;
             u->buffer.last = u->buffer.start;
 
@@ -2886,11 +2920,16 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
 
 #if (NGX_HTTP_CACHE)
 
+    /* 注意这时候还是在读取第一个头部行的过程中(可能会携带部分或者全部包体数据在里面) */
     if (r->cache && r->cache->file.fd != NGX_INVALID_FILE) {
         ngx_pool_run_cleanup_file(r->pool, r->cache->file.fd);
         r->cache->file.fd = NGX_INVALID_FILE;
     }
 
+    /*
+     proxy_no_cache配置指令可以使upstream模块不在缓存满足既定条件的请求得到的响应。
+     由上面ngx_http_test_predicates函数及相关代码完成。
+    */
     switch (ngx_http_test_predicates(r, u->conf->no_cache)) {
 
     case NGX_ERROR:
@@ -2902,10 +2941,15 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
         break;
 
     default: /* NGX_OK */
-
-        if (u->cache_status == NGX_HTTP_CACHE_BYPASS) {
+        // 在客户端请求上游数据的时候，如果没有命中，则会把cache_status置为NGX_HTTP_CACHE_BYPASS
+        if (u->cache_status == NGX_HTTP_CACHE_BYPASS) { 
+            // 说明是因为配置了xxx_cache_bypass功能，从而直接从后端取数据
 
             /* create cache if previously bypassed */
+            /*
+             proxy_cache_bypass 配置指令可以使满足既定条件的请求绕过缓存数据，但是这些
+             请求的响应数据依然可以被upstream模块缓存。
+            */
 
             if (ngx_http_file_cache_create(r) != NGX_OK) {
                 ngx_http_upstream_finalize_request(r, u, NGX_ERROR);
@@ -2916,14 +2960,22 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
         break;
     }
 
+    /*
+    u->cacheable 用于控制是否对响应进行缓存操作。其默认值为1，在缓存读取过程中可因某些条件
+    将其设置为0，即不在缓存该请求的响应数据。
+    */
     if (u->cacheable) {
         time_t  now, valid;
 
         now = ngx_time();
 
+        /*
+        * 缓存内容的有效时间由proxy_cache_valid配置指令设置，并且未经该指令设置的响应
+        * 数据是不会被upstream模块缓存的。
+        */ 
         valid = r->cache->valid_sec;
 
-        if (valid == 0) {
+        if (valid == 0) { // 赋值proxy_cache_valid xxx 4m;中的4m
             valid = ngx_http_file_cache_valid(u->conf->cache_valid,
                                               u->headers_in.status_n);
             if (valid) {
@@ -2933,11 +2985,15 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
 
         if (valid) {
             r->cache->date = now;
+            // 在该函数前ngx_http_upsteam_process_header->p->process_header(0函数中已经解析
+            // 出包体头部行)
+            // (u->buffer.pos - u->buffer.start) 的值表示后端返回的网页包体部分在buffer中的存储位置
             r->cache->body_start = (u_short) (u->buffer.pos - u->buffer.start);
 
             if (u->headers_in.status_n == NGX_HTTP_OK
                 || u->headers_in.status_n == NGX_HTTP_PARTIAL_CONTENT)
             {
+                // 上游服务器返回的头部行"Last-Modified:XXX"赋值
                 r->cache->last_modified = u->headers_in.last_modified_time;
 
                 if (u->headers_in.etag) {
@@ -2952,6 +3008,12 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
                 ngx_str_null(&r->cache->etag);
             }
 
+            /*
+            * 注意这时候还是在读取第一个头部行的过程中(可能携带部分或全部包体数据)
+            *
+            * upstream模块在申请u->buffer空间时，已经预先为缓存文件包头分配了空间，所以
+            * 直接调用 ngx_http_file_cache_set_header在此空间中初始化缓存文件包头。
+            */
             if (ngx_http_file_cache_set_header(r, u->buffer.start) != NGX_OK) {
                 ngx_http_upstream_finalize_request(r, u, NGX_ERROR);
                 return;
@@ -2975,16 +3037,17 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
     }
 
 #endif
-
+    // buffering=1方式会走到这里，通过pipe发送，如果为0，则上面的程序会return
     p = u->pipe;
 
+    // 设置filter，可以看到就是http的输出filter
     p->output_filter = ngx_http_upstream_output_filter;
     p->output_ctx = r;
     p->tag = u->output.tag;
-    p->bufs = u->conf->bufs;
-    p->busy_size = u->conf->busy_buffers_size;
-    p->upstream = u->peer.connection;
-    p->downstream = c;
+    p->bufs = u->conf->bufs; //设置bufs，它就是upstream中设置的bufs.u == &flcf->upstream;
+    p->busy_size = u->conf->busy_buffers_size; //默认
+    p->upstream = u->peer.connection; // 赋值跟后端upsteam的连接
+    p->downstream = c; // 赋值跟客户端的连接
     p->pool = r->pool;
     p->log = c->log;
     p->limit_rate = u->conf->limit_rate;
@@ -3007,6 +3070,11 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
         p->temp_file->persistent = 1;
 
 #if (NGX_HTTP_CACHE)
+        /*
+        * 默认情况下p->temp_file->path = u->conf->temp_path; 也就是由proxy_temp_path指定路径，
+        * 但是如果是缓存方式(p->cacheable=1)并且配置proxy_cache_path /a/b的时候带有 use_temp_path=off
+        * 表示不使用proxy_temp_path配置的路径，而使用指定的临时路径/a/b/temp
+        */
         if (r->cache && r->cache->file_cache->temp_path) {
             p->temp_file->path = r->cache->file_cache->temp_path;
         }
@@ -3034,13 +3102,16 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
         return;
     }
 
-    p->preread_bufs->buf = &u->buffer;
+    p->preread_bufs->buf = &u->buffer; //把包体部分的pos和last存储到p->preread_bufs->buf
     p->preread_bufs->next = NULL;
     u->buffer.recycled = 1;
 
+    // 之前读取后端头部行信息的时候的buf还有剩余数据，这部分数据就是包体数据
     p->preread_size = u->buffer.last - u->buffer.pos;
 
     if (u->cacheable) {
+        // 注意走到这里的时候，前面已经把后端头部行信息解析出来了，
+        // u->buffer.pos指向的是实际数据部分
 
         p->buf_to_file = ngx_calloc_buf(r->pool);
         if (p->buf_to_file == NULL) {
@@ -3048,6 +3119,12 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
             return;
         }
 
+        // 指向的是为获取后端头部行的时候分配的第一个缓冲区，buf大小由proxy_buffer_size决定
+        /*
+        * 这里面只存储了头部行buffer中头部行的内容部分，因为后面写临时文件的时候，需要把后
+        * 端头部行也写进来，由于前面读取头部行后指针已经指向了数据部分，因此需要临时用
+        * buf_to_file->start指向头部行部分开始, pos指向数据部分开始，也就是头部行部分结尾
+        */
         p->buf_to_file->start = u->buffer.start;
         p->buf_to_file->pos = u->buffer.start;
         p->buf_to_file->last = u->buffer.pos;

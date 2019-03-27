@@ -819,8 +819,9 @@ found:
 #if (NGX_HTTP_CACHE)
 
 /*
-* ngx_http_upsteam_init_request->ngx_http_upstream_cache 客户端获取缓存 后端应答回来数据后
-* 在ngx_http_upstream_send_response->ngx_http_file_cache_create 中创建临时文件，然后在
+* ngx_http_upstream_init_request->ngx_http_upstream_cache 客户端获取缓存 
+* 后端应答回来数据后，在ngx_http_upstream_send_response->ngx_http_file_cache_create
+* 中创建临时文件，然后在
 * ngx_event_pipe_write_chain_to_temp_file把读取的后端数据写入临时文件，最后在
 * ngx_http_upstream_send_response->ngx_http_upstream_process_request->ngx_http_file_cache_update
 * 中把临时文件rename到proxy_cache_path指定的cache目录下面
@@ -834,33 +835,37 @@ ngx_http_upstream_cache(ngx_http_request_t *r, ngx_http_upstream_t *u)
 
     c = r->cache;
 
-    if (c == NULL) {
+    if (c == NULL) { /* 如果还未给当前请求分配缓存相关结构体，则创建并初始化 */
 
+        // 例如proxy_cache_methods设置的只缓存GET|HEAD，当客户端请求方法是GET时，则直接返回
         if (!(r->method & u->conf->cache_methods)) {
             return NGX_DECLINED;
         }
 
+        // 查找共享内存块，并将地址赋值给cache
         rc = ngx_http_upstream_cache_get(r, u, &cache);
 
         if (rc != NGX_OK) {
             return rc;
         }
 
+        // Enables or disables the conversion of the "HEAD" method to "GET" for caching.
         if (r->method == NGX_HTTP_HEAD && u->conf->cache_convert_head) {
             u->method = ngx_http_core_get_method;
         }
 
+        // 分配ngx_http_cache_t结构，并赋值给c，初始化r->cache->keys
         if (ngx_http_file_cache_new(r) != NGX_OK) {
             return NGX_ERROR;
         }
 
-        if (u->create_key(r) != NGX_OK) {
+        if (u->create_key(r) != NGX_OK) { // 解析proxy_cache_key 的参数值到r->cache->keys
             return NGX_ERROR;
         }
 
         /* TODO: add keys */
 
-        ngx_http_file_cache_create_key(r);
+        ngx_http_file_cache_create_key(r); // 生成md5sum(key)和crc32(key)并计算c->header_start值
 
         if (r->cache->header_start + 256 >= u->conf->buffer_size) {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -873,14 +878,19 @@ ngx_http_upstream_cache(ngx_http_request_t *r, ngx_http_upstream_t *u)
             return NGX_DECLINED;
         }
 
-        u->cacheable = 1;
+        u->cacheable = 1; // 默认所有请求的响应结果都是可被缓存的
 
         c = r->cache;
 
         c->body_start = u->conf->buffer_size;
+        // proxy_cache_min_uses 1; sets the number of requests after which the response will be cached.
         c->min_uses = u->conf->cache_min_uses;
         c->file_cache = cache;
 
+        /*
+        * 根据配置文件中(proxy_cache_bypass)缓存绕过条件和请求信息，判断是否应该
+        * 继续尝试使用缓存数据响应该请求。
+        */
         switch (ngx_http_test_predicates(r, u->conf->cache_bypass)) {
 
         case NGX_ERROR:
@@ -890,10 +900,20 @@ ngx_http_upstream_cache(ngx_http_request_t *r, ngx_http_upstream_t *u)
             u->cache_status = NGX_HTTP_CACHE_BYPASS;
             return NGX_DECLINED;
 
-        default: /* NGX_OK */
+        default: /* NGX_OK */ // 应该从后端服务器重新获取
             break;
         }
 
+        /*
+        * Syntax:   proxy_cache_lock on | off;
+        * Default:  proxy_cache_lock off;
+        *
+        * When enabled, only one request at a time will be allowed to populate a new cache
+        * element identified according to the proxy_cache_key directive by passing a request
+        * to proxied server. Other requests of the same cache elemenet will either wait for 
+        * a response to appear in the cache or the cache lock for this element to be released,
+        * up to the time set by the proxy_cache_lock_timeout directive.
+        */
         c->lock = u->conf->cache_lock;
         c->lock_timeout = u->conf->cache_lock_timeout;
         c->lock_age = u->conf->cache_lock_age;
@@ -911,6 +931,16 @@ ngx_http_upstream_cache(ngx_http_request_t *r, ngx_http_upstream_t *u)
     case NGX_HTTP_CACHE_UPDATING:
 
         if (u->conf->cache_use_stale & NGX_HTTP_UPSTREAM_FT_UPDATING) {
+            /*
+            * 如果设置了proxy_cache_use_stale updating, 表示说虽然该缓存文件失效了，已经有其他
+            * 客户端请求在获取后端数据，但是现在还没有获取完整，这时候把过期的缓存返回给
+            * 当前请求的客户端
+            */
+
+            /* 
+            * proxy_cache_use_stale determines in which cases a stale cached response can
+            * be used during communication with the proxied server.
+            */
             u->cache_status = rc;
             rc = NGX_OK;
 
@@ -920,7 +950,7 @@ ngx_http_upstream_cache(ngx_http_request_t *r, ngx_http_upstream_t *u)
 
         break;
 
-    case NGX_OK:
+    case NGX_OK: // 缓存正常命中
         u->cache_status = NGX_HTTP_CACHE_HIT;
     }
 
@@ -930,7 +960,7 @@ ngx_http_upstream_cache(ngx_http_request_t *r, ngx_http_upstream_t *u)
 
         return NGX_OK;
 
-    case NGX_HTTP_CACHE_STALE:
+    case NGX_HTTP_CACHE_STALE: // 表示缓存过期
 
         c->valid_sec = 0;
         u->buffer.start = NULL;
@@ -939,6 +969,8 @@ ngx_http_upstream_cache(ngx_http_request_t *r, ngx_http_upstream_t *u)
         break;
 
     case NGX_DECLINED:
+        //表示缓存文件存在，获取缓存文件前面的头部部分时检查有问题，没有通过检查
+        //或者缓存文件不存在(第一次请求该uri或者没有达到开始缓存的请求次数)
 
         if ((size_t) (u->buffer.end - u->buffer.start) < u->conf->buffer_size) {
             u->buffer.start = NULL;
@@ -950,9 +982,10 @@ ngx_http_upstream_cache(ngx_http_request_t *r, ngx_http_upstream_t *u)
 
         break;
 
-    case NGX_HTTP_CACHE_SCARCE:
+    case NGX_HTTP_CACHE_SCARCE: // 没有达到请求次数，只有达到请求次数才会缓存
 
-        u->cacheable = 0;
+        u->cacheable = 0; 
+        //这里置0，就是说如果配置5次开始缓存，则前面4次都不会缓存，把cacheable置0就不会缓存了
 
         break;
 
@@ -988,10 +1021,15 @@ ngx_http_upstream_cache_get(ngx_http_request_t *r, ngx_http_upstream_t *u,
     ngx_http_file_cache_t  **caches;
 
     if (u->conf->cache_zone) {
+        /*
+        * 获取proxy_cache设置的共享内存块名，直接返回u->conf->cache_zone->data
+        * 这个是在proxy_cache_path 设置的，因此必须同时设置proxy_cache和proxy_cache_path
+        */
         *cache = u->conf->cache_zone->data;
         return NGX_OK;
     }
 
+    // proxy_cache xxx$ss中带有参数
     if (ngx_http_complex_value(r, u->conf->cache_value, &val) != NGX_OK) {
         return NGX_ERROR;
     }
@@ -1002,7 +1040,8 @@ ngx_http_upstream_cache_get(ngx_http_request_t *r, ngx_http_upstream_t *u,
         return NGX_DECLINED;
     }
 
-    caches = u->caches->elts;
+    // 在proxy_cache_path设置的zone_key中查找有没有对应的共享内存名 //keys_zone=fcgi:10m中的fcgi
+    caches = u->caches->elts; 
 
     for (i = 0; i < u->caches->nelts; i++) {
         name = &caches[i]->shm_zone->shm.name;

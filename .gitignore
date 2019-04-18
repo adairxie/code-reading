@@ -1,1 +1,5 @@
 *.o
+.vscode/
+nginx-1.11.3/objs/
+nginx-1.11.3/pcre-8.21/
+nginx-1.11.3/zlib-1.2.11/

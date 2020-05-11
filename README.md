@@ -1,5 +1,4 @@
-# nginx&openresty源码阅读
-
+# source code reading plan
 2020年完成源码阅读计划，深入理解实现原理
 
 ## nginx
@@ -17,3 +16,11 @@
 * lua vm 嵌入方式
 * luajit gc
 * directives实现原理
+
+## redis
+
+## etcd
+
+## consul
+
+## nsqd

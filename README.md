@@ -1,5 +1,5 @@
 # source code reading plan
-2020年完成源码阅读计划，深入理解实现原理
+2020年完成源码阅读计划及学习计划，深入理解实现原理
 
 ## nginx
 
@@ -27,3 +27,10 @@
 
 ## cloudflare博客
   https://blog.cloudflare.com/
+## 《图解性能优化》
+
+## 《linux操作系统设计及原理》
+
+## rabbitmq
+
+## mongodb
